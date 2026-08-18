@@ -3,6 +3,13 @@
 """Smoke test for all GEMM variants. Skips variants not available on current GPU."""
 
 import sys
+from pathlib import Path
+
+# Running as `python3 tests/smoke_gemm_all_test.py` puts tests/ on sys.path[0],
+# which shadows the repo jax_aiter package. Prefer the repo root when present.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if (_REPO_ROOT / "jax_aiter").is_dir() and str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import jax
 import jax.numpy as jnp

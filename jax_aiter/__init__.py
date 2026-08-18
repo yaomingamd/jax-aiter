@@ -4,8 +4,9 @@
 
 import importlib as _importlib
 
-from .ja_compat.config import set_aiter_asm_dir
+from .ja_compat.config import sanitize_runtime_env, set_aiter_asm_dir
 
+sanitize_runtime_env()
 set_aiter_asm_dir()
 
 __all__ = ["mha", "ops"]
