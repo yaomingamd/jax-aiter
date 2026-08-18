@@ -1,0 +1,89 @@
+# Slim jax-aiter image: multi-stage build drops source tree and JIT intermediates.
+# Saves several GB vs keeping /workspace/jax-aiter + build/aiter_build/build/.
+#
+# Build:
+#   docker build -f Dockerfile_jax_aiter.slim -t jax-aiter:slim .
+#
+# Apply patch before build (instead of COPY overlay):
+#   patch -p1 < jax-aiter-gpu_archs_ck_targets.patch
+
+# ---------- builder ----------
+FROM rocm/jax-private:rocm7.2.3-jax0.8.2-te2.12-py3.12 AS builder
+
+ENV JA_ROOT_DIR=/workspace/jax-aiter
+ENV AITER_SYMBOL_VISIBLE=1
+ENV GPU_ARCHS=gfx950
+ENV GPU_DEVICE_TARGETS=gfx950
+ENV PYTORCH_ROCM_ARCH=gfx950
+ENV AITER_ARCH=gfx950
+ENV GPU_TARGETS=gfx950
+ENV AITER_ASM_DIR=/workspace/jax-aiter/third_party/aiter/hsa/
+ENV MAX_JOBS=128
+ENV CMAKE_BUILD_PARALLEL_LEVEL=128
+ENV MAKEFLAGS=-j128
+
+RUN mkdir /workspace \
+ && git config --global user.name "Yaoming Mu" \
+ && git config --global user.email "yaoming.mu@amd.com"
+
+WORKDIR /workspace
+RUN git clone https://github.com/yaomingamd/jax-aiter.git \
+ && cd jax-aiter \
+ && git submodule update --init --recursive third_party/aiter \
+ && cd third_party/aiter \
+ && git checkout main \
+ && git cherry-pick 4af1556 \
+ && git submodule update --init --recursive
+
+COPY jax-aiter-gpu_archs_ck_targets.patch /tmp/
+COPY jax-aiter-src/jax_aiter/jit/build_jit.py /workspace/jax-aiter/jax_aiter/jit/build_jit.py
+COPY jax-aiter-src/Makefile /workspace/jax-aiter/Makefile
+
+RUN cd /workspace/jax-aiter \
+ && python3 -m pip install --break-system-packages cmake ninja psutil build \
+ && make GPU_ARCHS="${GPU_ARCHS}" -j"$(nproc)" \
+ && python3 jax_aiter/jit/build_jit.py --verbose \
+ && make GPU_ARCHS="${GPU_ARCHS}" -j"$(nproc)" ja_mods \
+ && pip wheel --no-deps --wheel-dir /tmp/wheels . \
+ && rm -rf \
+      /workspace/jax-aiter/.git \
+      /workspace/jax-aiter/third_party/aiter/.git \
+      /workspace/jax-aiter/third_party/aiter/3rdparty/composable_kernel/.git \
+      /workspace/jax-aiter/build/aiter_build/build \
+      /root/.cache/pip
+
+# ---------- runtime ----------
+FROM rocm/jax-private:rocm7.2.3-jax0.8.2-te2.12-py3.12
+
+# Wheel install mode: setup.py stages built .so files into jax_aiter/_lib and
+# HSA kernels into jax_aiter/_hsa inside site-packages. Do NOT set JA_ROOT_DIR
+# or AITER_ASM_DIR here — those force dev-mode paths (/opt/jax-aiter/build,
+# third_party/aiter/hsa/) which are intentionally absent in this slim image.
+ENV AITER_SYMBOL_VISIBLE=1
+ENV GPU_ARCHS=gfx950
+ENV XLA_PYTHON_CLIENT_ALLOCATOR=platform
+
+COPY --from=builder /tmp/wheels /tmp/wheels
+COPY jax-aiter-src/jax_aiter/ja_compat/config.py /tmp/jax_aiter_patches/config.py
+RUN pip install --break-system-packages /tmp/wheels/*.whl \
+ && cp /tmp/jax_aiter_patches/config.py /usr/local/lib/python3.12/dist-packages/jax_aiter/ja_compat/config.py \
+ && rm -rf /tmp/wheels /tmp/jax_aiter_patches /root/.cache/pip \
+ && python3 - <<'PY'
+import os
+from pathlib import Path
+import jax_aiter
+
+pkg = Path(jax_aiter.__file__).parent
+lib = pkg / "_lib" / "jax_aiter_build" / "libjax_aiter.so"
+hsa = pkg / "_hsa" / "gfx950"
+assert lib.is_file(), f"missing umbrella lib: {lib}"
+assert hsa.is_dir(), f"missing HSA gfx950 tree: {hsa}"
+assert not os.environ.get("JA_ROOT_DIR"), "JA_ROOT_DIR must be unset in slim runtime"
+from jax_aiter.mha import flash_attn_func  # noqa: F401
+from jax_aiter.ja_compat.config import set_aiter_asm_dir
+set_aiter_asm_dir()
+assert Path(os.environ["AITER_ASM_DIR"]).is_dir()
+print("[slim runtime] jax-aiter wheel OK:", lib)
+PY
+
+WORKDIR /workspace

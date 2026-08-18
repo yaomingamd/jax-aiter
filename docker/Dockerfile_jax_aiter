@@ -1,0 +1,39 @@
+FROM rocm/jax-private:rocm7.2.3-jax0.8.2-te2.12-py3.12 
+ENV JA_ROOT_DIR=/workspace/jax-aiter
+ENV AITER_SYMBOL_VISIBLE=1
+ENV GPU_ARCHS=gfx950
+ENV GPU_DEVICE_TARGETS=gfx950          
+ENV PYTORCH_ROCM_ARCH=gfx950
+ENV AITER_ARCH=gfx950
+ENV GPU_TARGETS=gfx950                  
+ENV AITER_ASM_DIR=/workspace/jax-aiter/third_party/aiter/hsa/
+ENV XLA_PYTHON_CLIENT_ALLOCATOR=platform
+# Parallel JIT/CK builds: aiter uses MAX_JOBS for ninja -j; make uses MAKEFLAGS.
+ENV MAX_JOBS=128
+ENV CMAKE_BUILD_PARALLEL_LEVEL=128
+ENV MAKEFLAGS=-j128
+# ENV JAX_ENABLE_X64=1
+RUN mkdir /workspace \
+   && git config --global user.name "Yaoming Mu" \
+   && git config --global user.email "yaoming.mu@amd.com"
+WORKDIR /workspace
+RUN git clone https://github.com/yaomingamd/jax-aiter.git \
+  && cd jax-aiter \
+  && git submodule update --init \
+  && git submodule update --init --recursive third_party/aiter \
+  && cd third_party/aiter \
+  && git checkout main \
+  && git cherry-pick 4af1556 \
+  && git submodule update --init --recursive \
+  && cd /workspace/jax-aiter
+
+# Overlay jax-aiter fixes: GPU_ARCHS -> CK --targets, Makefile offload-arch.
+COPY jax-aiter-src/jax_aiter/jit/build_jit.py /workspace/jax-aiter/jax_aiter/jit/build_jit.py
+COPY jax-aiter-src/Makefile /workspace/jax-aiter/Makefile
+
+RUN cd /workspace/jax-aiter \
+  && python3 -m pip install --break-system-packages cmake ninja psutil \
+  && make GPU_ARCHS="${GPU_ARCHS}" -j"$(nproc)" \
+  && python3 jax_aiter/jit/build_jit.py --verbose \
+  && make GPU_ARCHS="${GPU_ARCHS}" -j"$(nproc)" ja_mods \
+  && pip install --break-system-packages .
