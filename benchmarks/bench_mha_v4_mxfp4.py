@@ -1,0 +1,138 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+"""Time dense MXFP4 FMHA v4 in JAX and, when aiter is importable, in PyTorch.
+
+The timed call is the whole recipe: Hadamard MXFP4 Q, coalesced K, FP6-P V,
+then the dense MXFP4 code object for the requested head dim. TFLOPS use
+4*B*H*Sq*Sk*head_dim. PyTorch time is a CUDA graph of the same call.
+
+    cd /dockerx/jax-aiter
+    PYTHONPATH=$PWD:$PWD/third_party/aiter \
+      JA_ROOT_DIR=$PWD AITER_ASM_DIR=$PWD/third_party/aiter/hsa/ \
+      GPU_ARCHS=gfx950 AITER_SYMBOL_VISIBLE=1 \
+      python3 benchmarks/bench_mha_v4_mxfp4.py
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+import time
+
+# Running ``python benchmarks/<script>.py`` puts only ``benchmarks`` on
+# sys.path. Prefer this checkout over any installed jax-aiter package, and
+# load the vendored aiter tree for the PyTorch comparison.
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_AITER_ROOT = os.path.join(_REPO_ROOT, "third_party", "aiter")
+for _path in (_REPO_ROOT, _AITER_ROOT):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+
+from jax_aiter.ja_compat.chip_info import get_gfx
+from jax_aiter.ops.mha_v4 import mha_v4_mxfp4
+
+
+def _flops(batch, sequence_q, sequence_k, heads, head_dim):
+    return 4 * batch * heads * sequence_q * sequence_k * head_dim
+
+
+def _jax_loop(fn, reps):
+    compiled = jax.jit(fn)
+    compiled().block_until_ready()
+
+    @jax.jit
+    def many():
+        def body(_, acc):
+            out = fn()
+            return acc + out[0, 0, 0, 0].astype(jnp.float32)
+
+        return jax.lax.fori_loop(0, reps, body, jnp.float32(0))
+
+    many().block_until_ready()
+    samples = []
+    for _ in range(5):
+        start = time.perf_counter()
+        many().block_until_ready()
+        samples.append((time.perf_counter() - start) * 1e6)
+    return sorted(samples)[len(samples) // 2] / reps
+
+
+def _torch_times(q, k, v, scale, warmup, iters):
+    """Replay a captured graph so the quant kernels and the ASM launch stay on device."""
+    import torch
+    from aiter.ops.mha_v4 import AttentionFormat, mha_v4
+
+    fmt = AttentionFormat.MXFP4
+    host_q = np.asarray(q).view(np.uint16).copy()
+    host_k = np.asarray(k).view(np.uint16).copy()
+    host_v = np.asarray(v).view(np.uint16).copy()
+    tq = torch.as_tensor(host_q, device="cuda").view(torch.bfloat16)
+    tk = torch.as_tensor(host_k, device="cuda").view(torch.bfloat16)
+    tv = torch.as_tensor(host_v, device="cuda").view(torch.bfloat16)
+
+    def call():
+        return mha_v4(tq, tk, tv, fmt, fmt, fmt, softmax_scale=scale)
+
+    for _ in range(warmup):
+        call()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        call()
+    for _ in range(warmup):
+        graph.replay()
+    torch.cuda.synchronize()
+    start, end = torch.cuda.Event(True), torch.cuda.Event(True)
+    start.record()
+    for _ in range(iters):
+        graph.replay()
+    end.record()
+    end.synchronize()
+    return start.elapsed_time(end) * 1000.0 / iters
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Benchmark dense MXFP4 FMHA v4")
+    parser.add_argument("--skip-torch", action="store_true")
+    parser.add_argument("--reps", type=int, default=8)
+    parser.add_argument("--head-dim", type=int, choices=(128, 256), default=128)
+    args = parser.parse_args()
+    if get_gfx() != "gfx950":
+        raise SystemExit(f"MXFP4 fmha_v4_fwd is for gfx950, got {get_gfx()}")
+
+    shapes = [
+        (1, 1024, 1024, 8),
+        (1, 1024, 4096, 8),
+        (1, 4096, 4096, 8),
+        (4, 4096, 4096, 16),
+        (4, 4096, 4096, 64),
+        (8, 8192, 8192, 16),
+    ]
+    head_dim = args.head_dim
+    print(f"gfx={get_gfx()} head_dim={head_dim} devices={jax.devices()}")
+    header = f"{'B':>3} {'Sq':>5} {'Sk':>5} {'H':>3} | {'jax us':>8} {'jax TF':>8}"
+    if not args.skip_torch:
+        header += f" | {'pt us':>8} {'pt TF':>8}"
+    print(header)
+    scale = head_dim ** -0.5
+    for batch, sequence_q, sequence_k, heads in shapes:
+        key = jax.random.PRNGKey(batch + sequence_q + sequence_k + heads)
+        q = jax.random.normal(key, (batch, sequence_q, heads, head_dim), dtype=jnp.bfloat16)
+        k = jax.random.normal(jax.random.fold_in(key, 1), (batch, sequence_k, heads, head_dim), dtype=jnp.bfloat16)
+        v = jax.random.normal(jax.random.fold_in(key, 2), k.shape, dtype=jnp.bfloat16)
+        micros = _jax_loop(lambda: mha_v4_mxfp4(q, k, v, softmax_scale=scale), args.reps)
+        work = _flops(batch, sequence_q, sequence_k, heads, head_dim)
+        row = f"{batch:3d} {sequence_q:5d} {sequence_k:5d} {heads:3d} | {micros:8.1f} {work / micros / 1e6:8.1f}"
+        if not args.skip_torch:
+            event = _torch_times(q, k, v, scale, warmup=3, iters=10)
+            row += f" | {event:8.1f} {work / event / 1e6:8.1f}"
+        print(row, flush=True)
+
+
+if __name__ == "__main__":
+    main()
