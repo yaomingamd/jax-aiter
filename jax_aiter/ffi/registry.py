@@ -26,6 +26,13 @@ _jax_initialized = False
 SYMBOL_TO_MODULE_MAP = {
     "MhaFwdUnifiedJA": "mha_fwd_ja.so",
     "MhaBwdUnifiedJA": "mha_bwd_ja.so",
+    "MhaV4FwdJA": "mha_v4_fwd_ja.so",
+    "MhaV4SparseFwdJA": "mha_v4_fwd_ja.so",
+    "MhaV4SparseWorkTableJA": "mha_v4_fwd_ja.so",
+    "MhaV4Mxfp4QuantQJA": "mha_v4_fwd_ja.so",
+    "MhaV4Mxfp4QuantKJA": "mha_v4_fwd_ja.so",
+    "MhaV4Mxfp4QuantVJA": "mha_v4_fwd_ja.so",
+    "MhaV4Mxfp4FwdJA": "mha_v4_fwd_ja.so",
     "RmsnormFwdJA": "rmsnorm_fwd_ja.so",
     "SiluAndMulJA": "silu_and_mul_ja.so",
     "GemmFwdJA": "gemm_fwd_ja.so",
