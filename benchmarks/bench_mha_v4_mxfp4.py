@@ -21,13 +21,22 @@ import sys
 import time
 
 # Running ``python benchmarks/<script>.py`` puts only ``benchmarks`` on
-# sys.path. Prefer this checkout over any installed jax-aiter package, and
-# load the vendored aiter tree for the PyTorch comparison.
+# sys.path. Use this checkout when it has been built, and load the vendored
+# aiter tree for the PyTorch comparison when that tree is present. A checkout
+# with no build must not hide an installed wheel.
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 _AITER_ROOT = os.path.join(_REPO_ROOT, "third_party", "aiter")
-for _path in (_REPO_ROOT, _AITER_ROOT):
-    if _path not in sys.path:
-        sys.path.insert(0, _path)
+_checkout_built = any(
+    os.path.isfile(os.path.join(_REPO_ROOT, *parts))
+    for parts in (
+        ("build", "jax_aiter_build", "libjax_aiter.so"),
+        ("jax_aiter", "_lib", "jax_aiter_build", "libjax_aiter.so"),
+    )
+)
+if _checkout_built and _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+if os.path.isdir(os.path.join(_AITER_ROOT, "aiter")) and _AITER_ROOT not in sys.path:
+    sys.path.insert(0, _AITER_ROOT)
 
 import jax
 import jax.numpy as jnp
