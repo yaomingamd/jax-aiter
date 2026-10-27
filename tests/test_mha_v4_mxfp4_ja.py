@@ -179,3 +179,136 @@ def test_mxfp4_hd256_dense_matches_aiter(batch, sequence_q, sequence_k, heads_q,
     assert got.shape[-1] == 256
     assert cosine > 0.999
     assert np.allclose(got, ref_np, rtol=2e-2, atol=2e-2)
+
+
+def _cosine(a, b):
+    af = np.asarray(a, dtype=np.float32).ravel()
+    bf = np.asarray(b, dtype=np.float32).ravel()
+    return float(np.dot(af, bf) / (np.linalg.norm(af) * np.linalg.norm(bf) + 1e-12))
+
+
+@pytest.mark.parametrize(
+    ("head_dim", "lengths", "padded", "heads"),
+    [
+        (128, (96, 40), 128, 4),
+        (256, (192, 128), 256, 4),
+        (256, (80, 160, 40), 192, 2),
+    ],
+)
+def test_mxfp4_seqlens_k_matches_truncated_batches(head_dim, lengths, padded, heads):
+    """Per-batch key lengths match the same kernel on physically truncated K/V.
+
+    A float32 reference sits near 0.98 cosine for MXFP4, which is looser than a
+    broken scale-stride. A truncated tail is quantized separately from the padded
+    final tile, so it is an accuracy control rather than a bitwise control.
+    """
+    batch = len(lengths)
+    sequence_q = 128 if head_dim == 128 else 256
+    q, k, v = _pair_hd(batch, sequence_q, padded, heads, heads, head_dim, 41)
+    seqlens = jnp.asarray(lengths, dtype=jnp.int32)
+    got = np.asarray(mha_v4_mxfp4(q, k, v, seqlens_k=seqlens))
+    dense = np.asarray(mha_v4_mxfp4(q, k, v))
+    assert not np.array_equal(got, dense)
+    for index, valid in enumerate(lengths):
+        truncated = np.asarray(
+            mha_v4_mxfp4(
+                q[index : index + 1],
+                k[index : index + 1, :valid],
+                v[index : index + 1, :valid],
+            )
+        )
+        assert _cosine(got[index : index + 1], truncated) > 0.999
+        np.testing.assert_allclose(got[index : index + 1], truncated, rtol=1e-1, atol=8e-2)
+
+
+@pytest.mark.parametrize("head_dim", [128, 256])
+def test_mxfp4_seqlens_k_full_length_matches_dense(head_dim):
+    q, k, v = _pair_hd(2, 128, 128, 2, 2, head_dim, 43)
+    dense = mha_v4_mxfp4(q, k, v)
+    full = mha_v4_mxfp4(q, k, v, seqlens_k=jnp.full((2,), 128, dtype=jnp.int32))
+    np.testing.assert_array_equal(np.asarray(dense), np.asarray(full))
+
+
+def test_mxfp4_rejects_bad_seqlens_k():
+    q, k, v = _pair_hd(2, 32, 32, 2, 2, 128, 1)
+    with pytest.raises(ValueError, match="int32"):
+        mha_v4_mxfp4(q, k, v, seqlens_k=jnp.asarray([1.0, 2.0]))
+
+
+@pytest.mark.parametrize(
+    ("head_dim", "heads_q", "heads_k", "bias"),
+    [(128, 4, 4, 0.0), (256, 4, 2, 0.0), (128, 8, 2, 3.0), (256, 8, 2, 3.0)],
+)
+def test_mxfp4_lse_matches_aiter(head_dim, heads_q, heads_k, bias):
+    """Log-sum-exp matches aiter, including the GQA K-mean restoration.
+
+    ``bias`` opens the K-smoothing gate. The exported value is the quantized-score
+    log-sum-exp plus ``softmax_scale * q · k_mean``, so the reference is aiter
+    rather than ``torch.logsumexp`` of the exact scores.
+    """
+    torch = _torch()
+    from aiter.ops.mha_v4 import AttentionFormat, mha_v4
+
+    q, k, v = _pair_hd(1, 128, 160, heads_q, heads_k, head_dim, 47)
+    if bias:
+        k = (k.astype(jnp.float32) * 0.05 + bias).astype(jnp.bfloat16)
+    got_out, got_lse = mha_v4_mxfp4(q, k, v, return_lse=True)
+    out_only = mha_v4_mxfp4(q, k, v)
+    fmt = AttentionFormat.MXFP4
+    ref_out, ref_lse = mha_v4(
+        _to_torch(torch, q),
+        _to_torch(torch, k),
+        _to_torch(torch, v),
+        fmt,
+        fmt,
+        fmt,
+        return_lse=True,
+    )
+    torch.cuda.synchronize()
+    got_lse_np = np.asarray(got_lse, dtype=np.float32)
+    ref_lse_np = ref_lse.float().cpu().numpy()
+    err = np.max(np.abs(got_lse_np - ref_lse_np))
+    assert got_lse.shape == ref_lse_np.shape
+    assert np.isfinite(got_lse_np).all()
+    assert np.array_equal(np.asarray(out_only), np.asarray(got_out))
+    assert _cosine(got_out, ref_out.float().cpu().numpy()) > 0.999
+    assert err < 0.05, err
+
+
+def test_mxfp4_hd256_seqlens_k_and_lse_match_aiter():
+    torch = _torch()
+    from aiter.ops.mha_v4 import AttentionFormat, mha_v4
+
+    lengths = (96, 160, 48)
+    q, k, v = _pair_hd(3, 128, 192, 4, 2, 256, 53)
+    seqlens = jnp.asarray(lengths, dtype=jnp.int32)
+    got_out, got_lse = mha_v4_mxfp4(q, k, v, return_lse=True, seqlens_k=seqlens)
+    fmt = AttentionFormat.MXFP4
+    ref_out, ref_lse = mha_v4(
+        _to_torch(torch, q),
+        _to_torch(torch, k),
+        _to_torch(torch, v),
+        fmt,
+        fmt,
+        fmt,
+        return_lse=True,
+        seqlens_k=torch.tensor(lengths, device="cuda", dtype=torch.int32),
+    )
+    torch.cuda.synchronize()
+    got_np = np.asarray(got_out, dtype=np.float32)
+    ref_np = ref_out.float().cpu().numpy()
+    lse_err = np.max(np.abs(np.asarray(got_lse, dtype=np.float32) - ref_lse.float().cpu().numpy()))
+    assert _cosine(got_np, ref_np) > 0.999
+    assert np.allclose(got_np, ref_np, rtol=2e-2, atol=2e-2)
+    assert lse_err < 0.05, lse_err
+    for index, valid in enumerate(lengths):
+        truncated = mha_v4(
+            _to_torch(torch, q[index : index + 1]),
+            _to_torch(torch, k[index : index + 1, :valid]),
+            _to_torch(torch, v[index : index + 1, :valid]),
+            fmt,
+            fmt,
+            fmt,
+        )
+        torch.cuda.synchronize()
+        assert _cosine(got_np[index : index + 1], truncated.float().cpu().numpy()) > 0.999
