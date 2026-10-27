@@ -5,7 +5,8 @@
 The code objects live in ``hsa/<arch>/fmha_v4_fwd``. jax-aiter's other MHA
 entry points (``flash_attn_func``) still go through CK / ASM v3. This module
 launches the BF16 dense and sorted-sparse rows, and the MXFP4 dense row
-at head dims 128 and 256.
+at head dims 128 and 256. MXFP4 accepts per-batch key lengths and can return
+the log-sum-exp of the quantized scores, with the K-smoothing shift restored.
 
 MXFP4 uses the FMHA producers (Hadamard Q, coalesced K, FP6-P V), not the
 GEMM ``cast_mxfp4`` layout. FP8, MXFP6, and INT8 rows are still not launched.
@@ -332,11 +333,14 @@ def _mxfp4_v_call(shape):
 
 
 @functools.lru_cache(maxsize=None)
-def _mxfp4_fwd_call(batch, sequence, heads, head_dim):
+def _mxfp4_fwd_call(batch, sequence, heads, head_dim, lse_shape):
     _ensure("MhaV4Mxfp4FwdJA")
     return jax.ffi.ffi_call(
         "MhaV4Mxfp4FwdJA",
-        jax.ShapeDtypeStruct((batch, sequence, heads, head_dim), jnp.bfloat16),
+        (
+            jax.ShapeDtypeStruct((batch, sequence, heads, head_dim), jnp.bfloat16),
+            jax.ShapeDtypeStruct(lse_shape, jnp.float32),
+        ),
         has_side_effect=False,
     )
 
@@ -443,31 +447,66 @@ def mha_v4_mxfp4_quantize_v(v):
     return _permute_v_hd256(raw, scale, batch, heads, sequence)
 
 
-def mha_v4_mxfp4(q, k, v, *, softmax_scale=None):
+def _restore_k_mean_in_lse(lse, q, k_mean, softmax_scale):
+    """Add back the score shift removed by K smoothing.
+
+    The kernel attends over ``k - k_mean``. A shift shared by every key cancels
+    in the softmax, so the output is unchanged, but the log-sum-exp moves by
+    ``softmax_scale * q · k_mean``. Query head ``j`` reads KV head ``j // ratio``.
+    """
+    heads_q, heads_k = q.shape[2], k_mean.shape[1]
+    mean = k_mean if heads_q == heads_k else jnp.repeat(k_mean, heads_q // heads_k, axis=1)
+    shift = jnp.einsum("bshd,bhd->bhs", q.astype(jnp.float32), mean.astype(jnp.float32))
+    return lse + shift * jnp.float32(softmax_scale)
+
+
+def _seqlens_arg(seqlens_k, batch):
+    if seqlens_k is None:
+        return _empty(jnp.int32)
+    seqlens = jnp.asarray(seqlens_k)
+    if seqlens.dtype != jnp.int32 or seqlens.ndim != 1 or seqlens.shape[0] < batch:
+        raise ValueError("seqlens_k must be int32 [batch]")
+    return seqlens
+
+
+def mha_v4_mxfp4(q, k, v, *, softmax_scale=None, return_lse=False, seqlens_k=None):
     """Dense non-causal MXFP4 FMHA v4. Output is bfloat16 BSHD.
 
     Head dim 128 launches ``fwd_hd128_mxfp4.co``. Head dim 256 launches
     ``fwd_hd256_mxfp4.co`` after the half-head producers and their permute.
     Q is premultiplied by ``softmax_scale * log2(e)`` inside the quantizer.
     K uses the smoothed mean above. V is packed for the FP6-P operand.
+
+    ``seqlens_k`` is an int32 ``[B]`` of valid key lengths. The kernel clamps
+    each batch to that length inside the padded K/V buffer. ``return_lse`` adds
+    a float32 ``[B, H, Sq]`` log-sum-exp of the quantized scores, with the
+    K-smoothing shift restored. It is safe for merging chunks from this same
+    recipe, and it is not an exact-math log-sum-exp.
     """
     q, k, v = _check_qkv(q, k, v, head_dims=(128, 256))
     scale = _scale_of(q, softmax_scale)
+    seqlens = _seqlens_arg(seqlens_k, q.shape[0])
+    k_mean = mha_v4_k_smooth(k)
     packed_q, q_scale = mha_v4_mxfp4_quantize_q(q, scale * _LOG2E)
-    raw_k, k_scale = mha_v4_mxfp4_quantize_k(k, mha_v4_k_smooth(k))
+    raw_k, k_scale = mha_v4_mxfp4_quantize_k(k, k_mean)
     raw_v, v_scale = mha_v4_mxfp4_quantize_v(v)
-    return _mxfp4_fwd_call(q.shape[0], q.shape[1], q.shape[2], q.shape[-1])(
+    lse_shape = (q.shape[0], q.shape[2], q.shape[1]) if return_lse else (0,)
+    out, lse = _mxfp4_fwd_call(q.shape[0], q.shape[1], q.shape[2], q.shape[-1], lse_shape)(
         packed_q,
         raw_k,
         raw_v,
         q_scale,
         k_scale,
         v_scale,
+        seqlens,
         seq_k=np.int32(k.shape[1]),
         heads_k=np.int32(k.shape[2]),
         softmax_scale=np.float32(scale),
         head_dim=np.int32(q.shape[-1]),
     )
+    if return_lse:
+        return out, _restore_k_mean_in_lse(lse, q, k_mean, scale)
+    return out
 
 
 def mha_v4_sparse_work_table(lut_count, batch: int, nhead: int, q_tiles: int):

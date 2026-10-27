@@ -6,8 +6,9 @@
 // The producers are the aiter HIP kernels (Hadamard+MXFP4 Q, coalesced K, FP6-P
 // V), which are packed for head dim 128. Head dim 256 reuses those kernels on a
 // half-head view and permutes the buffers in JAX before this launch. The launch
-// selects fwd_hd128_mxfp4.co or fwd_hd256_mxfp4.co from the manifest. Scale
-// buffers keep the same zeroed slack the ASM gather reads past the logical sequence.
+// selects fwd_hd128_mxfp4.co or fwd_hd256_mxfp4.co from the manifest. Both
+// objects read per-batch key lengths from kernarg 0x1C0 and can export LSE.
+// Scale buffers keep the zeroed slack the K/V gathers read past the sequence.
 
 #include <cstdint>
 #include <cstring>
@@ -190,6 +191,10 @@ bool fits_u32(int64_t value, uint32_t* out) {
     return false;
   *out = static_cast<uint32_t>(value);
   return true;
+}
+
+bool nonempty(const ffi::AnyBuffer& buf) {
+  return buf.size_bytes() > 0 && buf.untyped_data() != nullptr;
 }
 
 ffi::Error u8_bytes(const ffi::AnyBuffer& buf, const char* name, int64_t bytes) {
@@ -407,7 +412,8 @@ ffi::Error MhaV4Mxfp4QuantV_Bridge(hipStream_t stream, ffi::AnyBuffer v,
 
 ffi::Error MhaV4Mxfp4Fwd_Bridge(hipStream_t stream, ffi::AnyBuffer q, ffi::AnyBuffer k,
                                 ffi::AnyBuffer v, ffi::AnyBuffer q_scale, ffi::AnyBuffer k_scale,
-                                ffi::AnyBuffer v_scale, ffi::Result<ffi::AnyBuffer> out,
+                                ffi::AnyBuffer v_scale, ffi::AnyBuffer seqlens_k,
+                                ffi::Result<ffi::AnyBuffer> out, ffi::Result<ffi::AnyBuffer> lse,
                                 int seq_k, int heads_k, float softmax_scale, int head_dim) {
   if (head_dim != kHeadDim && head_dim != 256) {
     return ffi::Error(ffi::ErrorCode::kInvalidArgument, "MXFP4 MHA head dim must be 128 or 256");
@@ -506,6 +512,40 @@ ffi::Error MhaV4Mxfp4Fwd_Bridge(hipStream_t stream, ffi::AnyBuffer q, ffi::AnyBu
   args.s_v_head_dim.value = static_cast<uint32_t>(head_dim);
   args.s_q_head_num.value = heads_u;
 
+  // A null kernarg keeps the padded key length. The rebuilt hd128 and hd256
+  // objects load this slot at 0x1C0 and clamp the KV loop per batch.
+  if (nonempty(seqlens_k)) {
+    if (seqlens_k.element_type() != ffi::DataType::S32 || seqlens_k.dimensions().size() != 1 ||
+        seqlens_k.dimensions()[0] < b) {
+      return ffi::Error(ffi::ErrorCode::kInvalidArgument, "seqlens_k must be int32 [batch]");
+    }
+    const int64_t n = seqlens_k.dimensions()[0];
+    if (static_cast<int64_t>(seqlens_k.size_bytes()) != n * static_cast<int64_t>(sizeof(int32_t))) {
+      return ffi::Error(ffi::ErrorCode::kInvalidArgument, "seqlens_k must be dense int32");
+    }
+    args.ptr_kseq.value = seqlens_k.untyped_data();
+  }
+
+  if (nonempty(*lse)) {
+    auto dims = lse->dimensions();
+    if (lse->element_type() != ffi::DataType::F32 || dims.size() != 3 || dims[0] != b ||
+        dims[1] != hq || dims[2] != sq) {
+      return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                        "lse must be float32 [batch, nhead_q, seqlen_q]");
+    }
+    const int64_t lse_numel = dims[0] * dims[1] * dims[2];
+    if (static_cast<int64_t>(lse->size_bytes()) != lse_numel * static_cast<int64_t>(sizeof(float))) {
+      return ffi::Error(ffi::ErrorCode::kInvalidArgument, "lse must be dense C-contiguous");
+    }
+    uint32_t lse_hs = 0;
+    if (!fits_u32(dims[2] * static_cast<int64_t>(sizeof(float)), &lse_hs)) {
+      return ffi::Error(ffi::ErrorCode::kInvalidArgument, "lse stride does not fit");
+    }
+    args.ptr_lse.value = lse->untyped_data();
+    args.s_lse.value = 1;
+    args.s_lse_Hs.value = lse_hs;
+  }
+
   AiterAsmKernel* kernel = nullptr;
   if (auto err = load_kernel(dev, *cfg, &kernel); !err.success()) return err;
   size_t arg_size = sizeof(args);
@@ -563,7 +603,9 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::AnyBuffer>()
         .Arg<ffi::AnyBuffer>()
         .Arg<ffi::AnyBuffer>()
+        .Arg<ffi::AnyBuffer>()  // seqlens_k int32 [B], or empty
         .Ret<ffi::AnyBuffer>()
+        .Ret<ffi::AnyBuffer>()  // lse f32 [B, Hq, Sq], or empty
         .Attr<int>("seq_k")
         .Attr<int>("heads_k")
         .Attr<float>("softmax_scale")
