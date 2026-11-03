@@ -41,6 +41,8 @@ SYMBOL_TO_MODULE_MAP = {
     "SiluAndMulJA": "silu_and_mul_ja.so",
     "GemmFwdJA": "gemm_fwd_ja.so",
     "GemmFp4FwdJA": "gemm_fp4_ja.so",
+    "Mxfp6GemmQuantJA": "gemm_mxfp6_ja.so",
+    "Mxfp6GemmFwdJA": "gemm_mxfp6_ja.so",
     "CastMxfp4JA": "cast_mxfp4_ja.so",
     "CastMxfp4KeyedSrJA": "cast_mxfp4_ja.so",
     "CastMxfp4DualJA": "cast_mxfp4_ja.so",
