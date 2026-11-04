@@ -67,8 +67,8 @@ def test_mxfp6_gemm_pack_sizes_include_abi_guard_tiles():
 
 
 def test_mxfp6_gemm_selects_natural_ordering_outside_short_k_swizzle_bounds():
-    assert default_mxfp6_gemm_kernel(576, 18432, 6144) == "f6gemm_dmabig_swz0_kernel_func"
-    assert default_mxfp6_gemm_kernel(576, 16384, 6144) == "f6gemm_dmabig_kernel_func"
+    assert default_mxfp6_gemm_kernel(576, 18432, 6144) == "_ZN5aiter34f6gemm_bf16_per1x32Fp6_dmabig_swz0E"
+    assert default_mxfp6_gemm_kernel(576, 16384, 6144) == "_ZN5aiter29f6gemm_bf16_per1x32Fp6_dmabigE"
 
 
 @pytest.mark.parametrize("m,n,k", [(256, 256, 128), (257, 259, 129)])
@@ -98,18 +98,18 @@ def test_mxfp6_gemm_rejects_invalid_operands():
 
 _SPECIALIZED_CASES = (
     ((9450, 5120, 5120), "_ZN5aiter44f6gemm_bf16_per1x32Fp6_m9472_n5120_k5120_m82E",
-     "f6gemm_dmabig_kernel_func"),
+     "_ZN5aiter29f6gemm_bf16_per1x32Fp6_dmabigE"),
     ((9450, 13824, 5120), "_ZN5aiter45f6gemm_bf16_per1x32Fp6_m9472_n13824_k5120_m82E",
-     "f6gemm_dmabig_kernel_func"),
+     "_ZN5aiter29f6gemm_bf16_per1x32Fp6_dmabigE"),
     ((9450, 5120, 13824), "_ZN5aiter45f6gemm_bf16_per1x32Fp6_m9472_n5120_k13824_m82E",
-     "f6gemm_dmabig_allk_kernel_func"),
+     "_ZN5aiter34f6gemm_bf16_per1x32Fp6_dmabig_allkE"),
 )
 _DIRECT_SCALE_CASES = (
-    ((257, 513, 129), "f6gemm_dmabig_swz0_kernel_func",
+    ((257, 513, 129), "_ZN5aiter34f6gemm_bf16_per1x32Fp6_dmabig_swz0E",
      "_ZN5aiter44f6gemm_bf16_per1x32Fp6_dmabig_m82_nat_dscaleE"),
-    ((513, 784, 1152), "f6gemm_dmabig_kernel_func",
+    ((513, 784, 1152), "_ZN5aiter29f6gemm_bf16_per1x32Fp6_dmabigE",
      "_ZN5aiter44f6gemm_bf16_per1x32Fp6_dmabig_m82_g32_dscaleE"),
-    ((256, 256, 6273), "f6gemm_dmabig_swz0_kernel_func",
+    ((256, 256, 6273), "_ZN5aiter34f6gemm_bf16_per1x32Fp6_dmabig_swz0E",
      "_ZN5aiter44f6gemm_bf16_per1x32Fp6_dmabig_m82_nat_dscaleE"),
 )
 

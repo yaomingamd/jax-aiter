@@ -35,7 +35,7 @@ constexpr int64_t kKGuardTiles = 2;
 constexpr int64_t kPackedTileBytes = 24576;
 constexpr int64_t kScaleTileBytes = 1024;
 constexpr int kMaxDevices = 16;
-constexpr char kDefaultKernel[] = "f6gemm_dmabig_kernel_func";
+constexpr char kDefaultKernel[] = "_ZN5aiter29f6gemm_bf16_per1x32Fp6_dmabigE";
 
 int64_t ceil_div(int64_t value, int64_t divisor) {
   return (value + divisor - 1) / divisor;

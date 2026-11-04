@@ -34,8 +34,8 @@ _K_TILE = 128
 _K_GUARD_TILES = 2
 _PACKED_TILE_BYTES = 24576
 _SCALE_TILE_BYTES = 1024
-_DEFAULT_KERNEL = "f6gemm_dmabig_kernel_func"
-_SAFE_FALLBACK_KERNEL = "f6gemm_dmabig_swz0_kernel_func"
+_DEFAULT_KERNEL = "_ZN5aiter29f6gemm_bf16_per1x32Fp6_dmabigE"
+_SAFE_FALLBACK_KERNEL = "_ZN5aiter34f6gemm_bf16_per1x32Fp6_dmabig_swz0E"
 
 
 def _ensure_registered() -> None:

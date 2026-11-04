@@ -134,7 +134,11 @@ $(GEMM_BF16_CFG): $(AITER_SRC_DIR)/hsa/codegen.py | $(GEMM_CONFIG_DIR)/
 $(GEMM_FP4_CFG): $(AITER_SRC_DIR)/hsa/codegen.py | $(GEMM_CONFIG_DIR)/
 	cd $(AITER_SRC_DIR) && AITER_GPU_ARCHS="$(GPU_ARCHS)" $(PYTHON3) hsa/codegen.py -m f4gemm -o $(CURDIR)/$(GEMM_CONFIG_DIR)
 
-$(GEMM_FP6_CFG): $(AITER_SRC_DIR)/hsa/codegen.py | $(GEMM_CONFIG_DIR)/
+# The manifest CSV names every kernel. codegen.py itself does not change
+# when AITER adds or renames kernels, so the CSV has to be a prerequisite or
+# a submodule update leaves the old table compiled into gemm_mxfp6_ja.so.
+F6GEMM_CSVS := $(wildcard $(AITER_SRC_DIR)/hsa/*/f6gemm/*.csv)
+$(GEMM_FP6_CFG): $(AITER_SRC_DIR)/hsa/codegen.py $(F6GEMM_CSVS) | $(GEMM_CONFIG_DIR)/
 	cd $(AITER_SRC_DIR) && AITER_GPU_ARCHS="$(GPU_ARCHS)" $(PYTHON3) hsa/codegen.py -m f6gemm -o $(CURDIR)/$(GEMM_CONFIG_DIR)
 
 $(JA_BUILD_DIR)/gemm_fwd_ja.so: csrc/ffi/gemm_fwd/gemm_fwd_ja.cu $(GEMM_BF16_CFG) | $(JA_BUILD_DIR)/
