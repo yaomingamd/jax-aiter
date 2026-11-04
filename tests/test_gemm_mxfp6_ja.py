@@ -8,7 +8,9 @@ rejection of an exact-shape kernel on the wrong shape. When PyTorch AITER is
 importable, the same kernel is also compared directly with ``gemm_a6w6``.
 """
 
+import csv
 import os
+import re
 from pathlib import Path
 
 import jax
@@ -112,6 +114,15 @@ _DIRECT_SCALE_CASES = (
     ((256, 256, 6273), "_ZN5aiter34f6gemm_bf16_per1x32Fp6_dmabig_swz0E",
      "_ZN5aiter44f6gemm_bf16_per1x32Fp6_dmabig_m82_nat_dscaleE"),
 )
+# The five exact-shape kernels added for the Ideogram DiT shapes. The other
+# four DiT shapes keep an existing generic kernel, so they are not new cases.
+_IDEOGRAM_EXACT_CASES = (
+    ((10240, 4608, 4608), "_ZN5aiter48f6gemm_bf16_per1x32Fp6_m10240_n4608_k4608_x4m84wE"),
+    ((10240, 12288, 4608), "_ZN5aiter49f6gemm_bf16_per1x32Fp6_m10240_n12288_k4608_x4m84wE"),
+    ((25600, 4608, 4608), "_ZN5aiter47f6gemm_bf16_per1x32Fp6_m25600_n4608_k4608_x5m84E"),
+    ((25600, 4608, 12288), "_ZN5aiter48f6gemm_bf16_per1x32Fp6_m25600_n4608_k12288_x5m84E"),
+    ((33280, 12288, 4608), "_ZN5aiter48f6gemm_bf16_per1x32Fp6_m33280_n12288_k4608_x5m84E"),
+)
 
 
 def _operands(m, n, k):
@@ -171,20 +182,27 @@ def _reference_gemm(a, b):
     return product.to(torch.bfloat16).float().cpu().numpy()
 
 
-def _manifest_kernel_names(m, n, k):
-    import csv
+def _manifest_csv():
+    configured = os.environ.get("AITER_ASM_DIR", "").strip()
+    if configured:
+        matches = list(Path(configured).glob("**/f6gemm/f6gemm_bf16_per1x32Fp6.csv"))
+        if matches:
+            return matches[0]
+    checkout = Path(__file__).resolve().parents[1]
+    return checkout / "third_party/aiter/hsa/gfx950/f6gemm/f6gemm_bf16_per1x32Fp6.csv"
 
-    root = Path(os.environ["AITER_ASM_DIR"])
-    matches = list(root.glob("**/f6gemm/f6gemm_bf16_per1x32Fp6.csv"))
-    if not matches:
-        raise FileNotFoundError(f"MXFP6 manifest not found below {root}")
+
+def _manifest_kernel_names(m, n, k):
+    manifest = _manifest_csv()
+    if not manifest.is_file():
+        raise FileNotFoundError(f"MXFP6 manifest not found: {manifest}")
     padded = (
         (m + 255) // 256 * 256,
         (n + 255) // 256 * 256,
         (k + 127) // 128 * 128,
     )
     names = []
-    with matches[0].open(newline="", encoding="utf-8") as file:
+    with manifest.open(newline="", encoding="utf-8") as file:
         for row in csv.DictReader(file):
             exact = tuple(int(row[key]) for key in ("exact_M", "exact_N", "exact_K"))
             limits = tuple(int(row[key]) for key in ("swizzle_max_M", "swizzle_max_N", "swizzle_max_K"))
@@ -209,6 +227,38 @@ def test_mxfp6_gemm_matches_quantized_reference(m, n, k):
 def test_mxfp6_specialized_kernel_matches_safe_kernel(shape, specialized, safe):
     a, b = _operands(*shape)
     baseline = gemm_mxfp6(a, b, kernel_name=safe)
+    actual = gemm_mxfp6(a, b, kernel_name=specialized)
+    assert jnp.array_equal(actual, baseline)
+
+
+def test_mxfp6_manifest_follows_aiter_kernel_names():
+    """AITER checks every manifest row, including the five renamed dmabig kernels."""
+    manifest = _manifest_csv()
+    with manifest.open(newline="", encoding="utf-8") as file:
+        rows = list(csv.DictReader(file))
+    exact = [
+        row for row in rows
+        if min(int(row[key]) for key in ("exact_M", "exact_N", "exact_K")) > 0
+    ]
+    non_wan = [row for row in exact if int(row["exact_M"]) != 9472]
+    assert len(exact) == 35
+    assert len(non_wan) == 32
+    present = {row["knl_name"] for row in rows}
+    assert {kernel for _, kernel in _IDEOGRAM_EXACT_CASES} <= present
+    for row in rows:
+        match = re.fullmatch(r"_ZN5aiter(\d+)(.+)E", row["knl_name"])
+        assert match is not None, row["knl_name"]
+        declared_length, entrypoint = match.groups()
+        assert int(declared_length) == len(entrypoint)
+        assert row["co_name"] == f"{entrypoint}.co"
+        assert (manifest.parent / row["co_name"]).is_file()
+
+
+@pytest.mark.parametrize("shape,specialized", _IDEOGRAM_EXACT_CASES)
+def test_mxfp6_ideogram_exact_kernel_matches_default(shape, specialized):
+    baseline_name = default_mxfp6_gemm_kernel(*shape)
+    a, b = _operands(*shape)
+    baseline = gemm_mxfp6(a, b, kernel_name=baseline_name)
     actual = gemm_mxfp6(a, b, kernel_name=specialized)
     assert jnp.array_equal(actual, baseline)
 
