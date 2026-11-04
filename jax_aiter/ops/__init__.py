@@ -11,6 +11,7 @@ Usage::
 """
 
 from .gemm_fp4 import gemm_fp4, cast_mxfp4, cast_mxfp4_dual
+from .gemm_mxfp6 import gemm_mxfp6, gemm_mxfp6_packed, quantize_mxfp6_gemm
 from .gemm_bf16 import gemm_bf16
 from .mha import mha_fwd, mha_bwd, MhaFwdConfig, MhaBwdConfig
 from .mha_v4 import mha_v4, mha_v4_kv_tile, mha_v4_mxfp4, mha_v4_sparse_work_table
@@ -21,6 +22,9 @@ __all__ = [
     "gemm_fp4",
     "cast_mxfp4",
     "cast_mxfp4_dual",
+    "gemm_mxfp6",
+    "gemm_mxfp6_packed",
+    "quantize_mxfp6_gemm",
     "gemm_bf16",
     "mha_fwd",
     "mha_bwd",
